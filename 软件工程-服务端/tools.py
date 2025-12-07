@@ -716,3 +716,20 @@ class DatabaseManager:
         else:
             self._execute(sql, params)
             return True
+    def get_user_id_by_player_name(self, player_name):
+        """通过玩家名获取用户ID"""
+        result = self._fetchone(
+            "SELECT u.UserID FROM Users u JOIN PlayerData pd ON u.UserID = pd.UserID WHERE pd.PlayerName = %s", 
+            (player_name,)
+        )
+        return result['UserID'] if result else None
+
+    def get_user_by_player_name(self, player_name):
+        """通过玩家名获取用户信息"""
+        return self._fetchone("""
+            SELECT u.*, pd.PlayerName, pd.WhiteState, ur.RoleID
+            FROM Users u 
+            JOIN PlayerData pd ON u.UserID = pd.UserID 
+            LEFT JOIN UserRoles_Con ur ON u.UserID = ur.UserID
+            WHERE pd.PlayerName = %s
+        """, (player_name,))

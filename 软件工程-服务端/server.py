@@ -8,12 +8,16 @@ Desktop 后端服务
 """
 import struct
 import socketserver, json, threading, traceback
-from tools import DatabaseManager
+from tools import DatabaseManager, RCON_CONFIG, _rcon
 import datetime, decimal
 import os
 import shutil
+import uuid
+import socket
+import time
 
 db = DatabaseManager()
+
 
 # 添加客户端连接管理
 class ClientConnectionManager:
@@ -21,25 +25,26 @@ class ClientConnectionManager:
         # 存储用户ID与连接的映射关系
         self.connections = {}
         self.lock = threading.Lock()
-    
+
     def add_connection(self, user_id, connection):
         """添加用户连接"""
         with self.lock:
             self.connections[int(user_id)] = connection
-            print(f"[S] 用户 {user_id} 连接已添加，当前连接数: {len(self.connections)} \n**当前链接映射：{self.connections}")
-    
+            print(
+                f"[S] 用户 {user_id} 连接已添加，当前连接数: {len(self.connections)} \n**当前链接映射：{self.connections}")
+
     def remove_connection(self, user_id):
         """移除用户连接"""
         with self.lock:
             if int(user_id) in self.connections:
                 del self.connections[int(user_id)]
                 print(f"[S] 用户 {user_id} 连接已移除，当前连接数: {len(self.connections)}")
-    
+
     def get_connection(self, user_id):
         """获取用户连接"""
         with self.lock:
             return self.connections.get(int(user_id))
-    
+
     def send_to_user(self, user_id, message):
         """向指定用户发送消息"""
         connection = self.get_connection(user_id)
@@ -58,11 +63,12 @@ class ClientConnectionManager:
         else:
             print(f"[W] 用户 {user_id} 不在线，无法发送实时消息")
             return False
-    
+
     def get_online_users(self):
         """获取在线用户列表"""
         with self.lock:
             return list(self.connections.keys())
+
 
 # 创建全局连接管理器实例
 connection_manager = ClientConnectionManager()
@@ -87,18 +93,18 @@ def route_login(data):
     user = db.check_login(u, p)
     if not user:
         return {"success": False, "message": "用户名或密码错误"}
-    
+
     # 检查用户是否已经在线（防止重复登录）
     if db.is_user_online(user["UserID"]):
         return {"success": False, "message": "该用户已在其他地方登录，无法重复登录"}
-    
+
     user['RoleID'] = db.get_role_by_uid(user['UserID'])  # 添加角色ID信息
     # 获取客户端IP地址
     client_ip = data.get("client_ip", "")
-    
+
     # 根据IP地址获取地理位置
     address = get_location_by_ip(client_ip)
-    
+
     db.log_login(user["UserID"], client_ip, address)
     # 用户登录时标记为在线，并更新最后在线时间
     db.user_online(user["UserID"])
@@ -107,17 +113,17 @@ def route_login(data):
     import datetime
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     db._execute("UPDATE Users SET last_online = %s WHERE UserID = %s", (now, user["UserID"]))
-    
+
     # 打印当前在线用户
     online_users = db.get_online_users()
     print(f"[S] 用户 {user['Username']} (ID: {user['UserID']}) 上线，当前在线用户: {online_users}")
-    
+
     # 获取未读消息信息
     unread_count = db.get_unread_messages_count(user["UserID"])
-    unread_details = {str(item['sender_id']): item['unread_count'] 
+    unread_details = {str(item['sender_id']): item['unread_count']
                       for item in db.get_unread_messages_by_contact(user["UserID"])}
-    
-    return {"success": True, "user": user, "online_users": online_users, 
+
+    return {"success": True, "user": user, "online_users": online_users,
             "unread_count": unread_count, "unread_details": unread_details}
 
 
@@ -127,7 +133,7 @@ def get_location_by_ip(ip):
     """
     if not ip or ip == "127.0.0.1":
         return "本地地址"
-    
+
     try:
         import requests
         # 使用ip-api.com免费接口获取地理位置
@@ -479,20 +485,19 @@ def route_process_whitelist_application(data):
 
         # 根据审核结果更新数据库
         if approved:
-            '''
-            # 使用RCON命令添加白名单
             try:
-                from mcrcon import MCRcon
-                from tools import RCON_CONFIG
-                with MCRcon(RCON_CONFIG['host'], RCON_CONFIG['password'], RCON_CONFIG['port']) as rcon:
-                    rcon.command(f"whitelist add {playername}")
+                # 使用RCON命令添加白名单
+                result = _rcon(f"wid add {playername}")
+                print(f"[RCON] {result}")
+                # 发送服务器公告
+                _rcon('''tellraw @a [{"text":"[RCON] ","color":"yellow","bold":true,"italic":false,"underlined":false,"strikethrough":false,"obfuscated":false},{"text":"恭喜玩家<","color":"green","bold":false,"italic":false,"underlined":false,"strikethrough":false,"obfuscated":false},{"text":"%s","color":"yellow","bold":false,"italic":false,"underlined":false,"strikethrough":false,"obfuscated":false},{"text":">通过了白名单审核！","color":"green","bold":false,"italic":false,"underlined":false,"strikethrough":false,"obfuscated":false}]''' % playername)
+                print(f"已通过RCON添加玩家 {playername} 到白名单")
             except Exception as e:
                 print(f"添加白名单失败: {e}")
-            '''
 
             # 更新数据库中的白名单状态
-            db._execute("UPDATE PlayerData SET WhiteState=1, PassDate=%s, Genuine=%s WHERE UserID=%s",
-                        (datetime.now().strftime('%Y-%m-%d'), genuine, user_id))
+            db._execute("UPDATE PlayerData SET WhiteState=1, PassDate=%s, Genuine=%s, PlayerName=%s WHERE UserID=%s",
+                        (datetime.now().strftime('%Y-%m-%d'), genuine, playername, user_id))
         else:
             # 如果申请被拒绝，确保白名单状态为0
             db._execute("UPDATE PlayerData SET WhiteState=0 WHERE UserID=%s", (user_id,))
@@ -577,7 +582,7 @@ def route_send_message(data):
 
     try:
         db.send_message(sender_id, receiver_id, content)
-        
+
         # 检查接收者是否在线
         if db.is_user_online(receiver_id):
             # 构造实时消息
@@ -588,16 +593,16 @@ def route_send_message(data):
                 "content": content,
                 "timestamp": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
-            
+
             # 发送实时消息给在线接收者
             response = {
                 "type": "real_time_message",
                 "message": message_data
             }
-            
+
             # 使用连接管理器发送实时消息
             connection_manager.send_to_user(receiver_id, response)
-            
+
         return {"success": True, "message": "消息发送成功"}
     except Exception as e:
         return {"success": False, "message": f"发送消息失败: {str(e)}"}
@@ -742,7 +747,7 @@ def route_user_online(data):
         user = db.get_user_by_id(user_id)
         username = user.get('Username', '未知用户') if user else '未知用户'
         print(f"[S] 用户 {username} (ID: {user_id}) 上线，当前在线用户: {online_users}")
-        
+
         # 返回当前在线用户列表
         return {"success": True, "message": "在线状态已更新", "online_users": online_users}
     except Exception as e:
@@ -764,7 +769,7 @@ def route_user_offline(data):
         user = db.get_user_by_id(user_id)
         username = user.get('Username', '未知用户') if user else '未知用户'
         print(f"[S] 用户 {username} (ID: {user_id}) 下线，当前在线用户: {online_users}")
-        
+
         # 返回当前在线用户列表
         return {"success": True, "message": "离线状态已更新", "online_users": online_users}
     except Exception as e:
@@ -788,11 +793,12 @@ def route_has_visible_messages(data):
            OR (sender_id = %s AND receiver_id = %s AND visible_to_receiver = TRUE))
         """
         result = db._fetchone(query, (user_id, contact_id, contact_id, user_id))
-        
+
         has_visible = result['count'] > 0 if result else False
         return {"success": True, "has_visible_messages": has_visible}
     except Exception as e:
         return {"success": False, "message": f"检查消息可见性失败: {str(e)}"}
+
 
 # 添加获取未读消息的路由
 def route_get_unread_messages(data):
@@ -803,32 +809,162 @@ def route_get_unread_messages(data):
 
     try:
         unread_count = db.get_unread_messages_count(user_id)
-        unread_details = {str(item['sender_id']): item['unread_count'] 
+        unread_details = {str(item['sender_id']): item['unread_count']
                           for item in db.get_unread_messages_by_contact(user_id)}
         return {"success": True, "unread_count": unread_count, "unread_details": unread_details}
     except Exception as e:
         return {"success": False, "message": f"获取未读消息失败: {str(e)}"}
+
 
 # 添加标记消息为已读的路由
 def route_mark_messages_as_read(data):
     """标记消息为已读"""
     user_id = data.get("user_id")
     contact_id = data.get("contact_id")
-    
+
     if not user_id or not contact_id:
         return {"success": False, "message": "缺少必要参数"}
-    
+
     try:
         db.mark_messages_as_read(user_id, contact_id)
         # 获取更新后的未读消息数
         unread_count = db.get_unread_messages_count(user_id)
-        unread_details = {str(item['sender_id']): item['unread_count'] 
+        unread_details = {str(item['sender_id']): item['unread_count']
                           for item in db.get_unread_messages_by_contact(user_id)}
         return {"success": True, "unread_count": unread_count, "unread_details": unread_details}
     except Exception as e:
         return {"success": False, "message": f"标记消息为已读失败: {str(e)}"}
 
+
 # 更新路由表，添加新路由
+def route_get_server_status(data):
+    """获取服务器状态"""
+    try:
+        # 检查MC服务器是否在线
+        mc_online = check_mc_server_online()
+
+        # 获取在线玩家列表
+        online_players = []
+        if mc_online:
+            try:
+                result = _rcon("list")
+                online_players = game_online_manager._parse_online_players(result)
+            except Exception as e:
+                print(f"获取在线玩家列表失败: {e}")
+        print(f"[S] 当前在线玩家: {online_players}")
+        return {
+            "success": True,
+            "mc_server_online": mc_online,
+            "online_players": online_players,
+            "online_count": len(online_players)
+        }
+    except Exception as e:
+        return {"success": False, "message": f"获取服务器状态失败: {str(e)}"}
+
+
+def route_execute_mc_command(data):
+    """执行Minecraft命令"""
+    command = data.get("command")
+    user_id = data.get("user_id")
+
+    if not command or not user_id:
+        return {"success": False, "message": "缺少必要参数"}
+
+    # 检查用户权限
+    user_role = db.get_role_by_uid(user_id)
+    if user_role != 1:  # 只有管理员可以执行命令
+        return {"success": False, "message": "权限不足"}
+
+    try:
+        if not check_mc_server_online():
+            return {"success": False, "message": "Minecraft服务器不在线"}
+
+        result = _rcon(command)
+        return {"success": True, "result": result}
+    except Exception as e:
+        return {"success": False, "message": f"执行命令失败: {str(e)}"}
+
+
+def route_kick_player(data):
+    """踢出玩家"""
+    player_name = data.get("player_name")
+    reason = data.get("reason", "被管理员踢出")
+    user_id = data.get("user_id")
+
+    if not player_name or not user_id:
+        return {"success": False, "message": "缺少必要参数"}
+
+    # 检查用户权限
+    user_role = db.get_role_by_uid(user_id)
+    if user_role != 1:  # 只有管理员可以踢人
+        return {"success": False, "message": "权限不足"}
+
+    try:
+        if not check_mc_server_online():
+            return {"success": False, "message": "Minecraft服务器不在线"}
+
+        result = _rcon(f"kick {player_name} {reason}")
+        return {"success": True, "message": f"玩家 {player_name} 已被踢出", "result": result}
+    except Exception as e:
+        return {"success": False, "message": f"踢出玩家失败: {str(e)}"}
+
+
+def route_get_game_online_users(data):
+    """获取游戏内在线用户列表"""
+    user_id = data.get("user_id")
+
+    if not user_id:
+        return {"success": False, "message": "缺少 user_id"}
+
+    # 检查用户权限
+    user_role = db.get_role_by_uid(user_id)
+    if user_role != 1:  # 只有管理员可以查看
+        return {"success": False, "message": "权限不足"}
+
+    try:
+        game_online_users = game_online_manager.get_game_online_users()
+
+        # 获取用户详细信息
+        users_info = []
+        for uid in game_online_users:
+            user = db.get_user_by_id(uid)
+            if user:
+                player_data = db._fetchone("SELECT PlayerName FROM PlayerData WHERE UserID = %s", (uid,))
+                users_info.append({
+                    "user_id": uid,
+                    "username": user["Username"],
+                    "nickname": user["Nickname"],
+                    "player_name": player_data["PlayerName"] if player_data else "未知"
+                })
+
+        return {
+            "success": True,
+            "game_online_users": users_info,
+            "count": len(users_info)
+        }
+    except Exception as e:
+        return {"success": False, "message": f"获取游戏在线用户失败: {str(e)}"}
+
+
+def route_refresh_game_online_status(data):
+    """手动刷新游戏内在线状态"""
+    user_id = data.get("user_id")
+
+    if not user_id:
+        return {"success": False, "message": "缺少 user_id"}
+
+    # 检查用户权限
+    user_role = db.get_role_by_uid(user_id)
+    if user_role != 1:  # 只有管理员可以刷新
+        return {"success": False, "message": "权限不足"}
+
+    try:
+        game_online_manager._update_game_online_status()
+        return {"success": True, "message": "游戏内在线状态已刷新"}
+    except Exception as e:
+        return {"success": False, "message": f"刷新失败: {str(e)}"}
+
+
 ROUTER = {
     "register": route_register,
     "login": route_login,
@@ -861,8 +997,115 @@ ROUTER = {
     "user_offline": route_user_offline,
     "has_visible_messages": route_has_visible_messages,
     "get_unread_messages": route_get_unread_messages,  # 添加获取未读消息路由
-    "mark_messages_as_read": route_mark_messages_as_read  # 添加标记消息为已读路由
+    "mark_messages_as_read": route_mark_messages_as_read,  # 添加标记消息为已读路由
+    # 服务器管理相关路由
+    "get_server_status": route_get_server_status,
+    "execute_mc_command": route_execute_mc_command,
+    "kick_player": route_kick_player,
+    "get_game_online_users": route_get_game_online_users,
+    "refresh_game_online_status": route_refresh_game_online_status
 }
+
+
+def check_mc_server_online():
+    """检查Minecraft服务器是否在线"""
+    try:
+        result = _rcon("list")
+        if "players online" in result:
+            print("[S] 服务器已上线，当前在线人数: %s" % len(result.split(":")[1].split(',')))
+        else:
+            print("[S] 服务器已离线")
+        return True
+    except Exception as e:
+        print(f"[S] 服务器离线检查失败: {e}")
+        return False
+
+
+# 游戏内在线状态管理
+class GameOnlineManager:
+    def __init__(self):
+        self.game_online_users = set()  # 存储游戏内在线的用户
+        self.lock = threading.Lock()
+        self.running = False
+
+    def start_monitoring(self):
+        """开始监控游戏内在线状态"""
+        if not self.running:
+            self.running = True
+            thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            thread.start()
+            print("开始监控游戏内在线状态...")
+
+    def stop_monitoring(self):
+        """停止监控"""
+        self.running = False
+        print("停止监控游戏内在线状态")
+
+    def _monitor_loop(self):
+        """监控循环，每60秒检查一次"""
+        while self.running:
+            try:
+                if check_mc_server_online():
+                    self._update_game_online_status()
+                time.sleep(60)  # 每60秒检查一次
+            except Exception as e:
+                print(f"监控循环出错: {e}")
+                time.sleep(60)
+
+    def _update_game_online_status(self):
+        """更新游戏内在线状态"""
+        try:
+            # 获取在线玩家列表
+            result = _rcon("list")
+            print(f"MC服务器响应: {result}")
+            _rcon("wid reload")
+
+            # 解析在线玩家列表
+            online_players = self._parse_online_players(result)
+
+            with self.lock:
+                # 清空当前游戏在线状态
+                self.game_online_users.clear()
+
+                # 根据玩家名查找对应的用户ID并标记为游戏在线
+                for player_name in online_players:
+                    user_id = db.get_user_id_by_player_name(player_name)
+                    if user_id:
+                        self.game_online_users.add(user_id)
+                        print(f"玩家 {player_name} (UID: {user_id}) 游戏内在线")
+
+            print(f"当前游戏内在线用户: {self.game_online_users}")
+
+        except Exception as e:
+            print(f"更新游戏内在线状态失败: {e}")
+
+    def _parse_online_players(self, list_result):
+        """解析list命令的结果，提取在线玩家名"""
+        try:
+            # 典型的list命令返回格式: "There are X players online: player1, player2, player3"
+            if "players online" in list_result:
+                # 提取冒号后面的玩家名部分
+                players_part = list_result.split(":", 1)[1].strip()
+                if players_part and players_part != "":
+                    return [name.strip() for name in players_part.split(",")]
+            return []
+        except Exception as e:
+            print(f"解析在线玩家列表失败: {e}")
+            return []
+
+    def is_user_game_online(self, user_id):
+        """检查用户是否游戏内在线"""
+        with self.lock:
+            return int(user_id) in self.game_online_users
+
+    def get_game_online_users(self):
+        """获取所有游戏内在线用户"""
+        with self.lock:
+            return list(self.game_online_users)
+
+
+# 创建全局游戏在线管理器实例
+game_online_manager = GameOnlineManager()
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
@@ -870,7 +1113,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
         # 保存客户端IP地址和当前用户ID的映射
         self.client_user_map = {}
         super().__init__(request, client_address, server)
-        
+
     @staticmethod
     def _pack(msg: dict) -> bytes:
         def _default(o):
@@ -911,7 +1154,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
                 client_sent_ip = req.get("client_ip", "未知")
                 if client_sent_ip != "未知":
                     client_ip = client_sent_ip
-                    
+
                 # 记录用户ID与连接的关联
                 if req.get("type") == "login" and req.get("user_id"):
                     current_user_id = req.get("user_id")
@@ -926,7 +1169,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
                         self.client_user_map[conn] = current_user_id
                         # 将连接添加到连接管理器
                         connection_manager.add_connection(current_user_id, conn)
-                
+
                 # 添加详细的日志信息
                 timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 req_type = req.get("type", "unknown")
@@ -962,7 +1205,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
                 user = db.get_user_by_id(user_id)
                 username = user.get('Username', '未知用户') if user else '未知用户'
                 print(f"[{timestamp}] [客户端 {client_ip}] 用户 {username} (ID: {user_id}) 断开连接")
-                
+
                 # 打印当前在线用户
                 online_users = db.get_online_users()
                 print(f"[S] 当前在线用户: {online_users}")
@@ -985,17 +1228,31 @@ class TCPHandler(socketserver.BaseRequestHandler):
                     username = user.get('Username', '未知用户') if user else '未知用户'
                     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     print(f"[{timestamp}] [客户端 {client_ip}] 用户 {username} (ID: {user_id}) 断开连接")
-                    
+
                     # 打印当前在线用户
                     online_users = db.get_online_users()
                     print(f"[S] 当前在线用户: {online_users}")
                 del self.client_user_map[conn]
 
+
 # --------------------------------------------------
 # 启动入口
 # --------------------------------------------------
 if __name__ == "__main__":
-    HOST, PORT = "0.0.0.0", 8000  
+    HOST, PORT = "0.0.0.0", 8000
     server = socketserver.ThreadingTCPServer((HOST, PORT), TCPHandler)
     print(f"[+] Desktop-Server 启动 @ {HOST}:{PORT}")
+
+    # 启动时立即获取一次服务器在线情况
+    print("[+] 正在初始化服务器状态...")
+    try:
+        if check_mc_server_online():
+            print("[+] Minecraft服务器在线")
+            # 启动游戏内在线状态监控
+            game_online_manager.start_monitoring()
+        else:
+            print("[-] Minecraft服务器离线")
+    except Exception as e:
+        print(f"[!] 初始化服务器状态时出错: {e}")
+
     server.serve_forever()

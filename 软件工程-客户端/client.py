@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import sys, json, socket, threading, traceback, time
 from PyQt5.QtWidgets import *
 from PyQt5.QtGui import *
@@ -6,6 +7,7 @@ import struct
 import datetime
 import socket as socket_module  # 添加socket模块用于获取本地IP
 import requests  # 添加requests模块用于获取公网IP
+from functools import partial
 
 
 # ========================= 网络客户端 =========================
@@ -120,6 +122,9 @@ class MainWindow(QMainWindow):
         self.client._main = self  # 将主窗口引用传递给client用于获取用户信息
         self.user = None
         self.unread_count = 0  # 添加未读消息计数
+        self.server_status_timer = QTimer()  # 添加服务器状态定时器
+        self.server_status_timer.timeout.connect(self.refresh_server_status)
+        self.online_users = set()  # 在线用户集合
         self._init_ui()
         self._bind_signal()
 
@@ -136,9 +141,12 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(DailyPage(self))  # 1
         self.stack.addWidget(ProfilePage(self))  # 2
         self.stack.addWidget(WhitelistPage(self))  # 3
-        self.stack.addWidget(QQPage(self))  # 4
+        #self.stack.addWidget(QQPage(self))  # 4
         self.stack.addWidget(MessagePage(self))  # 5 添加传声筒页面
         self.stack.addWidget(AdminPage(self))  # 6 管理员面板移到索引6
+
+        # 只有在需要时才添加服务器控制台页面
+        # self.stack.addWidget(ServerConsolePage(self))  # 7 添加服务器控制台页面
 
         self.status = QLabel("未登录")
         self.statusBar().addWidget(self.status)
@@ -184,6 +192,14 @@ class MainWindow(QMainWindow):
                     item.setText("传声筒")
                 break
 
+    # 添加刷新服务器状态的方法（仅在管理员登录后使用）
+    def refresh_server_status(self):
+        """刷新服务器状态"""
+        if self.user:
+            self.client.send({
+                "type": "get_server_status"
+            }, lambda resp: self._on_server_status(resp))
+
     # -------------------- 信号绑定 --------------------
     def _bind_signal(self):
         self.client.resp_sig.connect(self._on_resp)
@@ -200,46 +216,60 @@ class MainWindow(QMainWindow):
                 if "online_users" in resp:
                     self.online_users = set(resp["online_users"])
                     # 更新主窗口中的在线用户列表
-                    if self._main and hasattr(self._main, 'stack'):
-                        for i in range(self._main.stack.count()):
-                            page = self._main.stack.widget(i)
+                    if hasattr(self, 'stack'):
+                        for i in range(self.stack.count()):
+                            page = self.stack.widget(i)
                             if isinstance(page, MessagePage):
                                 page.online_users = self.online_users
-                                page._refresh_contact_list()
+                                if hasattr(page, '_refresh_contact_list'):
+                                    page._refresh_contact_list()
                                 break
 
-                self._update_nav_visibility()  # 添加：更新导航栏可见性
+                self._update_navbar_visibility()  # 添加：更新导航栏可见性
                 # 登录成功时上报在线状态
-                self.send({"type": "user_online", "user_id": self.user["UserID"]},
-                          callback=lambda r: None)
+                self.client.send({"type": "user_online", "user_id": self.user["UserID"]},
+                                 callback=lambda r: None)
 
                 # 登录成功后查询未读消息
                 self._check_unread_messages()
 
                 # 登录成功后立即获取联系人列表
-                if hasattr(self, '_main') and self._main:
-                    for i in range(self._main.stack.count()):
-                        page = self._main.stack.widget(i)
-                        if isinstance(page, MessagePage):
-                            page._refresh_contacts()
-                            break
+                for i in range(self.stack.count()):
+                    page = self.stack.widget(i)
+                    if isinstance(page, MessagePage):
+                        page._refresh_contacts()
+                        break
 
-                QMessageBox.information(self, "提示", "登录成功！")
+                # 如果是管理员，显示管理员面板和服务器控制台
+                if self.user.get('RoleID') == 1:
+                    self._show_admin_interface()
+
+                # 切换到主页
+                self.nav.setCurrentRow(0)
+                self._switch_tab()
+
+                QMessageBox.information(self, "登录成功", f"欢迎回来，{self.user['Nickname']}")
             else:
-                QMessageBox.warning(self, "失败", resp.get("message"))
+                QMessageBox.warning(self, "登录失败", resp.get("message", "未知错误"))
+
         elif t == "register":
-            QMessageBox.information(self, "提示", "注册成功！" if resp.get("success") else resp.get("message"))
-        # 添加对在线用户列表更新的处理
+            if resp.get("success"):
+                QMessageBox.information(self, "注册成功", "请登录")
+            else:
+                QMessageBox.warning(self, "注册失败", resp.get("message", "未知错误"))
+
         elif t == "user_online" or t == "get_contacts":
             if "online_users" in resp:
                 self.online_users = set(resp["online_users"])
                 # 更新所有消息页面的在线用户列表
-                if self._main and hasattr(self._main, 'stack'):
-                    for i in range(self._main.stack.count()):
-                        page = self._main.stack.widget(i)
+                if hasattr(self, 'stack'):
+                    for i in range(self.stack.count()):
+                        page = self.stack.widget(i)
                         if isinstance(page, MessagePage):
                             page.online_users = self.online_users
-                            page._refresh_contact_list()
+                            if hasattr(page, '_refresh_contact_list'):
+                                page._refresh_contact_list()
+
         # 添加对实时消息的处理
         elif t == "real_time_message":
             # 处理实时消息，即使不在传声筒页面也要处理未读消息
@@ -256,7 +286,8 @@ class MainWindow(QMainWindow):
                         page = self.stack.widget(i)
                         if isinstance(page, MessagePage):
                             page.unread_counts = resp.get("unread_details", {})
-                            page._refresh_contact_list()
+                            if hasattr(page, '_refresh_contact_list'):
+                                page._refresh_contact_list()
                             break
 
     def _handle_real_time_message(self, resp):
@@ -274,20 +305,23 @@ class MainWindow(QMainWindow):
                     # 更新未读消息计数
                     page.unread_counts[sender_id_str] = page.unread_counts.get(sender_id_str, 0) + 1
                     self._update_unread_count(1)  # 更新总未读数
-                    page._refresh_contact_list()  # 刷新联系人列表显示
+                    if hasattr(page, '_refresh_contact_list'):
+                        page._refresh_contact_list()  # 刷新联系人列表显示
 
                     # 如果当前在消息页面，直接显示消息
                     if self.stack.currentIndex() == 5:  # 传声筒页面索引为5
                         # 如果正在与发送方聊天，直接显示消息
                         if page.current_contact and page.current_contact["UserID"] == sender_id:
-                            page._display_new_message(message)
+                            if hasattr(page, '_display_new_message'):
+                                page._display_new_message(message)
                             # 当用户正在查看聊天时，标记消息为已读
                             if self.user:
                                 self.client.send({
                                     "type": "mark_messages_as_read",
                                     "user_id": self.user["UserID"],
                                     "contact_id": sender_id
-                                }, callback=page._on_messages_marked_as_read)
+                                }, callback=lambda r: None)
+                    break
 
     def _check_unread_messages(self):
         """查询用户未读消息"""
@@ -297,6 +331,64 @@ class MainWindow(QMainWindow):
                 "type": "get_unread_messages",
                 "user_id": self.user["UserID"]
             }, callback=self._on_resp)
+
+    def _on_server_status(self, resp):
+        """处理服务器状态响应"""
+        if resp.get("success"):
+            # 更新主页面的服务器状态显示
+            home_page = self.stack.widget(0)
+            if hasattr(home_page, 'update_server_status'):
+                home_page.update_server_status(resp)
+
+    def _update_navbar_visibility(self):
+        """根据用户权限更新导航栏显示"""
+        if self.user and self.user.get('RoleID') == 1:  # 管理员
+            # 确保导航栏包含所有项目
+            current_items = [self.nav.item(i).text() for i in range(self.nav.count())]
+            if "白名单申请" not in current_items:
+                self.nav.addItem("白名单申请")
+            if "传声筒" not in current_items:
+                self.nav.addItem("传声筒")
+            if "管理员面板" not in current_items:
+                self.nav.addItem("管理员面板")
+            if "服务器控制台" not in current_items:
+                self.nav.addItem("服务器控制台")
+        elif self.user:  # 普通用户
+            # 只显示基本功能
+            current_items = [self.nav.item(i).text() for i in range(self.nav.count())]
+            # 清除管理员项目
+            items_to_remove = []
+            for i in range(self.nav.count()):
+                item_text = self.nav.item(i).text()
+                if item_text in ["管理员面板", "服务器控制台"]:
+                    items_to_remove.append(self.nav.item(i))
+
+            for item in items_to_remove:
+                row = self.nav.row(item)
+                self.nav.takeItem(row)
+
+            # 添加用户功能
+            if "白名单申请" not in current_items:
+                self.nav.addItem("白名单申请")
+            if "传声筒" not in current_items:
+                self.nav.addItem("传声筒")
+        else:  # 未登录
+            # 重置导航栏
+            self.nav.clear()
+            self.nav.addItems(["主页", "签到/排行", "个人资料"])
+
+    def _show_admin_interface(self):
+        """显示管理员界面"""
+        # 确保管理员可以看到所有功能
+        self._update_navbar_visibility()
+        # 添加服务器控制台页面
+        if self.stack.count() < 8:  # 确保没有重复添加
+            self.stack.addWidget(ServerConsolePage(self))
+        # 启动服务器状态定时器
+        self.server_status_timer.start(30000)  # 每30秒刷新一次
+
+    def _switch_tab(self):
+        idx = self.nav.currentRow()
         # 修改索引检查，管理员面板现在在索引6
         if idx == 6 and (not self.user or not self.user.get("RoleID") or self.user.get("RoleID") != 1):
             QMessageBox.warning(self, "权限不足", "仅管理员可见")
@@ -308,135 +400,61 @@ class MainWindow(QMainWindow):
         current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         user_info = "未登录" if not self.user else self.user['Username']
         # 更新页面名称列表，添加传声筒选项
-        page_names = ["主页", "签到/排行", "个人资料", "白名单申请", "QQ 绑定", "传声筒", "管理员控制台"]
+        page_names = ["主页", "签到/排行", "个人资料", "白名单申请", "QQ 绑定", "传声筒", "管理员控制台",
+                      "服务器控制台"]
         page_name = page_names[idx] if idx < len(page_names) else f"页面{idx}"
         print(f"[C] {current_time} <{user_info}> 切换到页面: {page_name}")
-        self.stack.setCurrentIndex(idx)
-        # 添加：切换页面时刷新内容
-        current_page = self.stack.currentWidget()
-        if hasattr(current_page, '_refresh'):
-            current_page._refresh()
 
-        # 如果切换到传声筒页面，更新未读消息显示
-        if idx == 5:  # 传声筒页面
-            self._update_unread_count(0)  # 确保未读计数正确显示
+        # 更新导航栏当前项
+        self.nav.setCurrentRow(idx)
 
-    # -------------------- 槽：保底兼容 --------------------
-
-    # 添加缺失的_switch_tab方法
-    def _switch_tab(self, item):
-        """处理导航栏点击切换页面"""
-        idx = self.nav.row(item)
-        # 修改索引检查，管理员面板现在在索引6
-        if idx == 6 and (not self.user or not self.user.get("RoleID") or self.user.get("RoleID") != 1):
-            QMessageBox.warning(self, "权限不足", "仅管理员可见")
-            # 重置选择到当前页面而不是主页
-            current_idx = self.stack.currentIndex()
-            self.nav.setCurrentRow(current_idx)
-            return
-        # 添加页面切换的日志信息
-        current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        user_info = "未登录" if not self.user else self.user['Username']
-        # 更新页面名称列表，添加传声筒选项
-        page_names = ["主页", "签到/排行", "个人资料", "白名单申请", "QQ 绑定", "传声筒", "管理员控制台"]
-        page_name = page_names[idx] if idx < len(page_names) else f"页面{idx}"
-        print(f"[C] {current_time} <{user_info}> 切换到页面: {page_name}")
-        self.stack.setCurrentIndex(idx)
-        # 添加：切换页面时刷新内容
-        current_page = self.stack.currentWidget()
-        if hasattr(current_page, '_refresh'):
-            current_page._refresh()
-
-        # 如果切换到传声筒页面，更新未读消息显示
-        if idx == 5:  # 传声筒页面
-            self._update_unread_count(0)  # 确保未读计数正确显示
-
-    # -------------------- 槽：保底兼容 --------------------
-    def _on_resp(self, resp: dict):
-        t = resp.get("type")
-
-    # -------------------- 登录 / 注册弹窗 --------------------
-
-    def _login(self):
-        dlg = LoginDialog(self)
-        dlg.exec_()
-        # 添加：登录后更新导航栏
-        self._update_nav_visibility()
-
-    def _logout(self):
-        """处理用户登出"""
-        reply = QMessageBox.question(self, '确认登出', '您确定要登出吗？',
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            # 用户登出时标记为离线
-            if self.user:
-                self.client.send({"type": "user_offline", "user_id": self.user["UserID"]},
-                                 callback=lambda resp: None)
-            self.user = None
-            self.status.setText("未登录")
-            self._update_nav_visibility()
-            # 添加：清理未读消息计数
-            self.unread_count = 0
-            # 切换到主页
-            self.nav.setCurrentRow(0)
-            self.stack.setCurrentIndex(0)
-            # 添加：清理个人资料页面内容
-            profile_page = self.stack.widget(2)  # 个人资料页面索引为2
-            if isinstance(profile_page, ProfilePage):
-                profile_page._clear_content()
-            QMessageBox.information(self, "提示", "您已成功登出！")
-
-    def _update_nav_visibility(self):
-        # 更新菜单栏显示
-        if self.user:
-            # 已登录：隐藏登录和注册，显示登出
-            self.loginAction.setVisible(False)
-            self.registerAction.setVisible(False)
-            self.logoutAction.setVisible(True)
+        # 检查索引是否在范围内
+        if idx < self.stack.count():
+            self.stack.setCurrentIndex(idx)
         else:
-            # 未登录：显示登录和注册，隐藏登出
-            self.loginAction.setVisible(True)
-            self.registerAction.setVisible(True)
-            self.logoutAction.setVisible(False)
+            print(f"[C] 警告: 索引 {idx} 超出范围，最大索引为 {self.stack.count() - 1}")
+            self.stack.setCurrentIndex(0)
 
-        # 清除所有额外的导航项
-        items_to_remove = []
-        for i in range(self.nav.count()):
-            item_text = self.nav.item(i).text()
-            if item_text in ["白名单申请", "QQ 绑定", "传声筒", "管理员控制台"] or item_text.startswith("传声筒 ("):
-                items_to_remove.append(self.nav.item(i))
+        # 添加：切换页面时刷新内容
+        current_page = self.stack.currentWidget()
+        if hasattr(current_page, '_refresh'):
+            current_page._refresh()
 
-        for item in items_to_remove:
-            row = self.nav.row(item)
-            self.nav.takeItem(row)
+        # 如果切换到传声筒页面，更新未读消息显示
+        if idx == 5:  # 传声筒页面
+            self._update_unread_count(0)  # 确保未读计数正确显示
 
-        # 如果未登录，只显示基础页面
-        if not self.user:
-            return
-
-        # 登录后根据用户状态添加页面
-        # 添加基础页面（如果尚未存在）
-        existing_items = [self.nav.item(i).text() for i in range(self.nav.count())]
-
-        if "白名单申请" not in existing_items:
-            # 删除了对白名单状态的检查，无论是否通过白名单都显示申请页面
-            self.nav.insertItem(3, "白名单申请")
-
-        if "QQ 绑定" not in existing_items:
-            self.nav.insertItem(4, "QQ 绑定")
-
-        # 添加传声筒页面
-        if "传声筒" not in existing_items:
-            self.nav.insertItem(5, "传声筒")  # 将索引改为5
-
-        # 如果是管理员，添加管理员控制台（现在在索引6）
-        if self.user and self.user.get("RoleID") == 1:
-            if "管理员控制台" not in existing_items:
-                self.nav.insertItem(6, "管理员控制台")  # 管理员面板放在索引6
+    # -------------------- 登录/注册 --------------------
+    def _login(self):
+        LoginDialog(self).exec_()
 
     def _register(self):
-        dlg = RegisterDialog(self)
-        dlg.exec_()
+        RegisterDialog(self).exec_()
+
+    def _logout(self):
+        if self.user:
+            self.client.send({"type": "user_offline", "user_id": self.user['UserID']})
+        self.user = None
+        self.status.setText("未登录")
+        self.logoutAction.setVisible(False)
+        self.loginAction.setVisible(True)
+        self.registerAction.setVisible(True)
+
+        # 停止服务器状态定时器
+        self.server_status_timer.stop()
+
+        # 重置导航栏
+        self.nav.clear()
+        self.nav.addItems(["主页", "签到/排行", "个人资料"])
+        self.nav.setCurrentRow(0)
+        self._switch_tab()
+
+        QMessageBox.information(self, "提示", "您已成功登出！")
+
+    def closeEvent(self, e):
+        if self.user:
+            self.client.send({"type": "user_offline", "user_id": self.user['UserID']})
+        e.accept()
 
 
 # ========================= 通用弹窗 =========================
@@ -451,7 +469,7 @@ class LoginDialog(QDialog):
     def _init_ui(self):
         form = QFormLayout(self)
         self.userEdit = QLineEdit()
-        self.pwdEdit = QLineEdit();
+        self.pwdEdit = QLineEdit()
         self.pwdEdit.setEchoMode(QLineEdit.Password)
         form.addRow("用户名：", self.userEdit)
         form.addRow("密  码：", self.pwdEdit)
@@ -465,7 +483,7 @@ class LoginDialog(QDialog):
     def _do_login(self):
         u, p = self.userEdit.text(), self.pwdEdit.text()
         if not u or not p:
-            QMessageBox.warning(self, "提示", "请输入完整");
+            QMessageBox.warning(self, "提示", "请输入完整")
             return
         self.client.send({"type": "login", "username": u, "password": p},
                          callback=self._on_login_resp)
@@ -474,7 +492,7 @@ class LoginDialog(QDialog):
         if resp.get("success"):
             self.main.user = resp["user"]
             self.main.status.setText(f"已登录：{self.main.user['Username']}")
-            self.main._update_nav_visibility()  # 添加：更新导航栏可见性
+            self.main._update_navbar_visibility()  # 添加：更新导航栏可见性
             # 登录成功时上报在线状态
             self.main.client.send({"type": "user_online", "user_id": self.main.user["UserID"]},
                                   callback=lambda r: None)
@@ -495,7 +513,7 @@ class RegisterDialog(QDialog):
     def _init_ui(self):
         form = QFormLayout(self)
         self.userEdit = QLineEdit()
-        self.pwdEdit = QLineEdit();
+        self.pwdEdit = QLineEdit()
         self.pwdEdit.setEchoMode(QLineEdit.Password)
         self.nickEdit = QLineEdit()
         self.emailEdit = QLineEdit()
@@ -520,7 +538,7 @@ class RegisterDialog(QDialog):
             ("nickname", self.nickEdit), ("email", self.emailEdit),
             ("phone", self.phoneEdit), ("playername", self.pnEdit)]}
         if not all(req.values()):
-            QMessageBox.warning(self, "提示", "请填写完整");
+            QMessageBox.warning(self, "提示", "请填写完整")
             return
         req["type"] = "register"
         # 修改回调函数，在注册成功后自动打开登录页面
@@ -537,7 +555,7 @@ class RegisterDialog(QDialog):
             login_dlg.exec_()
 
 
-# ========================= 子页面 =========================
+# ========================= 子页面基类 =========================
 class BasePage(QWidget):
     def __init__(self, parent: MainWindow):
         super().__init__()
@@ -545,13 +563,68 @@ class BasePage(QWidget):
         self.client = parent.client
 
 
+# ========================= 主页 =========================
 class HomePage(BasePage):
-    def __init__(self, parent):
-        super().__init__(parent)
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+        self._init_ui()
+
+    def _init_ui(self):
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("欢迎来到用户管理系统", alignment=Qt.AlignCenter))
+
+        # 添加服务器状态显示区域
+        self.server_status_group = QGroupBox("服务器状态")
+        server_layout = QVBoxLayout()
+
+        self.server_status_label = QLabel("正在检查服务器状态...")
+        self.online_count_label = QLabel("在线人数: 0")
+        self.online_players_label = QLabel("在线玩家: 无")
+
+        # 添加刷新按钮
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self.refresh_server_status)
+
+        server_layout.addWidget(self.server_status_label)
+        server_layout.addWidget(self.online_count_label)
+        server_layout.addWidget(self.online_players_label)
+        server_layout.addWidget(refresh_btn)
+
+        self.server_status_group.setLayout(server_layout)
+        lay.addWidget(self.server_status_group)
 
 
+    def update_server_status(self, status_data):
+        """更新服务器状态显示"""
+        mc_online = status_data.get("mc_server_online", False)
+        online_players = status_data.get("online_players", [])
+
+        if mc_online:
+            self.server_status_label.setText("✅ Minecraft服务器在线")
+            self.server_status_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.server_status_label.setText("❌ Minecraft服务器离线")
+            self.server_status_label.setStyleSheet("color: red; font-weight: bold;")
+
+        self.online_count_label.setText(f"在线人数: {len(online_players)}")
+
+        if online_players:
+            players_text = "在线玩家: " + ", ".join(online_players)
+        else:
+            players_text = "在线玩家: 无"
+        self.online_players_label.setText(players_text)
+
+    def refresh_server_status(self):
+        """刷新服务器状态"""
+        if self.main.user:
+            self.main.client.send({
+                "type": "get_server_status"
+            }, lambda resp: self.update_server_status(resp))
+
+
+
+
+# ========================= 签到/排行页面 =========================
 class DailyPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
@@ -577,7 +650,7 @@ class DailyPage(BasePage):
 
     def _sign(self):
         if not self.main.user:
-            QMessageBox.warning(self, "提示", "请先登录");
+            QMessageBox.warning(self, "提示", "请先登录")
             return
         self.client.send({"type": "sign", "user_id": self.main.user["UserID"]},
                          callback=self._on_sign)
@@ -608,6 +681,7 @@ class DailyPage(BasePage):
             table.setItem(i, 2, QTableWidgetItem(str(row[key])))
 
 
+# ========================= 个人资料页面 =========================
 class ProfilePage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
@@ -802,7 +876,7 @@ class ProfilePage(BasePage):
             dialog.exec_()
 
 
-# 添加编辑资料对话框类
+# ========================= 编辑资料对话框 =========================
 class EditProfileDialog(QDialog):
     def __init__(self, parent: MainWindow, user_data):
         super().__init__(parent, Qt.WindowCloseButtonHint)
@@ -912,6 +986,7 @@ class EditProfileDialog(QDialog):
             QMessageBox.warning(self, "失败", f"更新失败：{resp.get('message')}")
 
 
+# ========================= 白名单申请页面 =========================
 class WhitelistPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
@@ -933,7 +1008,7 @@ class WhitelistPage(BasePage):
 
     def _apply(self):
         if not self.main.user:
-            QMessageBox.warning(self, "提示", "请先登录");
+            QMessageBox.warning(self, "提示", "请先登录")
             return
 
         # 检查用户是否已经通过白名单审核
@@ -1008,9 +1083,10 @@ class WhitelistPage(BasePage):
             # 更新主窗口用户信息
             if passed_count > 0 and self.main.user:
                 self.main.user["WhiteState"] = 1
-                self.main._update_nav_visibility()
+                self.main._update_navbar_visibility()
 
 
+# ========================= QQ绑定页面 =========================
 class QQPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
@@ -1070,7 +1146,7 @@ class QQPage(BasePage):
 
     def _bind(self):
         if not self.main.user:
-            QMessageBox.warning(self, "提示", "请先登录");
+            QMessageBox.warning(self, "提示", "请先登录")
             return
         qq, ok = QInputDialog.getText(self, "绑定 QQ", "请输入 QQ 号：")
         if ok and qq:
@@ -1079,6 +1155,7 @@ class QQPage(BasePage):
                                  self, "结果", "绑定成功！" if r.get("success") else r.get("message")))
 
 
+# ========================= 管理员面板 =========================
 class AdminPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
@@ -1343,7 +1420,6 @@ class AdminPage(BasePage):
                     upBtn = QPushButton("升级")
                     upBtn.setFixedSize(60, 30)  # 增大按钮尺寸
                     # 修复：使用functools.partial避免lambda捕获问题
-                    from functools import partial
                     # 修复：确保 UserID 存在
                     if "UserID" in u:
                         upBtn.clicked.connect(partial(self._role, u["UserID"], role_id_int - 1))
@@ -1353,7 +1429,6 @@ class AdminPage(BasePage):
                     downBtn = QPushButton("降级")
                     downBtn.setFixedSize(60, 30)  # 增大按钮尺寸
                     # 修复：使用functools.partial避免lambda捕获问题
-                    from functools import partial
                     # 修复：确保 UserID 存在
                     if "UserID" in u:
                         downBtn.clicked.connect(partial(self._role, u["UserID"], role_id_int + 1))
@@ -1505,7 +1580,6 @@ class AdminPage(BasePage):
                     rejectBtn.setFixedSize(60, 30)  # 增大按钮尺寸
 
                     # 修复：使用functools.partial避免lambda捕获问题
-                    from functools import partial
                     # 修复：确保必要字段存在
                     date = app.get("date")
                     user_id = app.get("user_id")
@@ -1548,6 +1622,7 @@ class AdminPage(BasePage):
             QMessageBox.warning(self, "失败", resp.get("message"))
 
 
+# ========================= 传声筒页面 =========================
 class MessagePage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
@@ -1713,77 +1788,11 @@ class MessagePage(BasePage):
             # 更新在线用户列表
             if "online_users" in resp:
                 self.online_users = set(resp["online_users"])
-            self.contact_list.clear()
-
-            # 过滤掉全是不可见消息的联系人
-            filtered_contacts = []
-            for contact in self.contacts:
-                # 检查与该联系人是否有可见消息
-                has_visible_messages = self._has_visible_messages_with_contact(contact["UserID"])
-                if has_visible_messages:
-                    filtered_contacts.append(contact)
-
-            for contact in filtered_contacts:
-                # 显示备注名（如果存在）或者默认显示用户名和昵称
-                # 修改显示格式为"备注（昵称）"或"用户名（昵称）"
-                if contact.get('remark') and contact['remark'] != contact['Nickname']:
-                    display_name = f"{contact['remark']} ({contact['Nickname']})"
-                else:
-                    display_name = contact['Nickname']
-
-                # 添加未读消息数显示
-                contact_id = str(contact["UserID"])
-                unread_count = self.unread_counts.get(contact_id, 0)
-                if unread_count > 0:
-                    display_name += f" ({unread_count})"
-
-                item = QListWidgetItem(display_name)
-                item.setData(Qt.UserRole, contact)
-                # 根据在线状态设置背景色
-                if contact["UserID"] in self.online_users:
-                    item.setBackground(QColor("#e0ffe0"))  # 浅绿色表示在线
-                self.contact_list.addItem(item)
-
+            self._refresh_contact_list()
             # 加载服务器保存的联系人备注
             self._load_server_remarks()
         else:
             QMessageBox.warning(self, "获取联系人失败", resp.get("message"))
-
-    def _handle_real_time_message(self, resp):
-        """处理实时消息"""
-        if resp.get("type") == "real_time_message":
-            message = resp.get("message", {})
-            sender_id = message.get("sender_id")
-
-            # 如果正在与发送方聊天，直接显示消息
-            if self.current_contact and str(self.current_contact["UserID"]) == str(sender_id):
-                self._display_new_message(message)
-                # 当用户正在查看聊天时，标记消息为已读
-                if self.main.user:
-                    self.main.client.send({
-                        "type": "mark_messages_as_read",
-                        "user_id": self.main.user["UserID"],
-                        "contact_id": sender_id
-                    }, callback=self._on_messages_marked_as_read)
-            else:
-                # 否则更新未读消息计数
-                sender_id_str = str(sender_id)
-                self.unread_counts[sender_id_str] = self.unread_counts.get(sender_id_str, 0) + 1
-                self.main._update_unread_count(1)  # 更新总未读数
-                self._refresh_contact_list()  # 刷新联系人列表显示
-
-    def _has_visible_messages_with_contact(self, contact_id):
-        """
-        检查与指定联系人是否有可见消息
-        """
-        if not self.main.user:
-            return False
-
-        # 发送请求检查是否有可见消息
-        # 这里我们假设如果联系人出现在联系人列表中，就说明有可见消息
-        # 或者我们可以简单地认为所有联系人都有可见消息
-        # 在实际实现中，可能需要调用服务器接口检查消息可见性
-        return True  # 简化处理，假设所有联系人都有可见消息
 
     def _load_server_remarks(self):
         """从服务器加载联系人备注"""
@@ -1897,7 +1906,7 @@ class MessagePage(BasePage):
                 text_cursor.insertHtml(content)
 
                 text_cursor.insertBlock()
-            elif msg['sender_id'] == self.main.user["UserID"]:  # 当前用户发送的消息
+            elif str(msg['sender_id']) == str(self.main.user["UserID"]):  # 当前用户发送的消息
                 block_format.setAlignment(Qt.AlignRight)
                 text_format.setForeground(QColor("#0084ff"))  # 蓝色文字
                 text_format.setFontWeight(QFont.Normal)  # 恢复正常字体粗细
@@ -1968,7 +1977,7 @@ class MessagePage(BasePage):
         for msg in messages:
             # 解析时间
             try:
-                msg_time = datetime.datetime.strptime(msg['timestamp'], '%Y-%m-%d %H:%M:%S')
+                msg_time = datetime.datetime.strptime(msg['timestamp'], '%Y-%m-d %H:%M:%S')
             except ValueError:
                 # 如果时间格式不正确，使用当前时间
                 msg_time = datetime.datetime.now()
@@ -2033,7 +2042,7 @@ class MessagePage(BasePage):
                 text_cursor.insertHtml(content)
 
                 text_cursor.insertBlock()
-            elif msg['sender_id'] == self.main.user["UserID"]:  # 当前用户发送的消息
+            elif str(msg['sender_id']) == str(self.main.user["UserID"]):  # 当前用户发送的消息
                 block_format.setAlignment(Qt.AlignRight)
                 text_format.setForeground(QColor("#0084ff"))  # 蓝色文字
                 text_format.setFontWeight(QFont.Normal)  # 恢复正常字体粗细
@@ -2120,65 +2129,43 @@ class MessagePage(BasePage):
         self.current_contact = None
         self.message_display.clear()
         self.contact_info_label.setText("")
-
         self.online_status_label.hide()
 
-    # 添加处理实时消息的方法
-    def _handle_real_time_message(self, message):
+    def _handle_real_time_message(self, resp):
         """处理实时消息"""
-        sender_id = message.get("sender_id")
-        content = message.get("content")
+        if resp.get("type") == "real_time_message":
+            message = resp.get("message", {})
+            sender_id = message.get("sender_id")
 
-        # 如果正在与发送方聊天，直接显示消息
-        if self.current_contact and self.current_contact["UserID"] == sender_id:
-            # 直接显示新消息
-            self._display_new_message(message)
-        else:
-            # 否则更新未读消息计数
-            sender_id_str = str(sender_id)
-            self.unread_counts[sender_id_str] = self.unread_counts.get(sender_id_str, 0) + 1
-            self.main._update_unread_count(1)  # 更新总未读数
-            self._refresh_contact_list()  # 刷新联系人列表显示
+            # 如果正在与发送方聊天，直接显示消息
+            if self.current_contact and str(self.current_contact["UserID"]) == str(sender_id):
+                self._display_new_message(message)
+            else:
+                # 否则更新未读消息计数
+                sender_id_str = str(sender_id)
+                self.unread_counts[sender_id_str] = self.unread_counts.get(sender_id_str, 0) + 1
+                self.main._update_unread_count(1)  # 更新总未读数
+                self._refresh_contact_list()  # 刷新联系人列表显示
 
     def _display_new_message(self, message):
         """显示新收到的消息"""
         # 格式化显示消息
         self._display_messages_append([message])
         # 滚动到底部
-        # self.message_display.moveCursor(QTextCursor.End)
+        self.message_display.moveCursor(QTextCursor.End)
 
-    def _refresh_contact_list(self):
-        """刷新联系人列表显示"""
-        self.contact_list.clear()
+    def _has_visible_messages_with_contact(self, contact_id):
+        """
+        检查与指定联系人是否有可见消息
+        """
+        if not self.main.user:
+            return False
 
-        # 过滤掉全是不可见消息的联系人
-        filtered_contacts = []
-        for contact in self.contacts:
-            # 检查与该联系人是否有可见消息
-            has_visible_messages = self._has_visible_messages_with_contact(contact["UserID"])
-            if has_visible_messages:
-                filtered_contacts.append(contact)
-
-        for contact in filtered_contacts:
-            # 显示备注名（如果存在）或者默认显示用户名和昵称
-            # 修改显示格式为"备注（昵称）"或"用户名（昵称）"
-            if contact.get('remark') and contact['remark'] != contact['Nickname']:
-                display_name = f"{contact['remark']} ({contact['Nickname']})"
-            else:
-                display_name = contact['Nickname']
-
-            # 添加未读消息数显示
-            contact_id = str(contact["UserID"])
-            unread_count = self.unread_counts.get(contact_id, 0)
-            if unread_count > 0:
-                display_name += f" ({unread_count})"
-
-            item = QListWidgetItem(display_name)
-            item.setData(Qt.UserRole, contact)
-            # 根据在线状态设置背景色
-            if contact["UserID"] in self.online_users:
-                item.setBackground(QColor("#e0ffe0"))  # 浅绿色表示在线
-            self.contact_list.addItem(item)
+        # 发送请求检查是否有可见消息
+        # 这里我们假设如果联系人出现在联系人列表中，就说明有可见消息
+        # 或者我们可以简单地认为所有联系人都有可见消息
+        # 在实际实现中，可能需要调用服务器接口检查消息可见性
+        return True  # 简化处理，假设所有联系人都有可见消息
 
     def _add_contact(self):
         """添加联系人"""
@@ -2612,24 +2599,8 @@ class MessagePage(BasePage):
         # 绑定客户端的实时消息信号到处理方法
         self.client.real_time_message.connect(self._handle_real_time_message)
 
-    def _handle_real_time_message(self, resp):
-        """处理实时消息"""
-        if resp.get("type") == "real_time_message":
-            message = resp.get("message", {})
-            sender_id = message.get("sender_id")
 
-            # 如果正在与发送方聊天，直接显示消息
-            if self.current_contact and str(self.current_contact["UserID"]) == str(sender_id):
-                self._display_new_message(message)
-            else:
-                # 否则更新未读消息计数
-                sender_id_str = str(sender_id)
-                self.unread_counts[sender_id_str] = self.unread_counts.get(sender_id_str, 0) + 1
-                self.main._update_unread_count(1)  # 更新总未读数
-                self._refresh_contact_list()  # 刷新联系人列表显示
-
-
-# 添加联系人对话框类
+# ========================= 添加联系人对话框 =========================
 class AddContactDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
@@ -2672,32 +2643,182 @@ class AddContactDialog(QDialog):
             QMessageBox.warning(self, "提示", "用户ID必须是数字")
             return
 
-        self.contact_id = contact_id
+        self.contact_id = int(contact_id)
         self.accept()
 
-    # ======================== 未读徽标控件 ========================
-    class ContactItemWidget(QWidget):
-        """联系人条目：昵称 + 未读红点"""
 
-        def __init__(self, nickname, parent=None):
-            super().__init__(parent)
-            self.lay = QHBoxLayout(self)
-            self.lab = QLabel(nickname)
-            self.badge = QLabel("0")
-            self.badge.setFixedSize(18, 18)
-            self.badge.setAlignment(Qt.AlignCenter)
-            self.badge.setStyleSheet("background:#ff4d4d;color:white;border-radius:9px;font:10px")
-            self.badge.hide()
-            self.lay.addWidget(self.lab)
-            self.lay.addStretch()
-            self.lay.addWidget(self.badge)
+# ========================= 服务器控制台页面 =========================
+class ServerConsolePage(QWidget):
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self._init_ui()
 
-        def set_unread(self, n):
-            if n > 0:
-                self.badge.setText(str(n) if n < 100 else "99+")
-                self.badge.show()
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 服务器状态区域
+        status_group = QGroupBox("服务器状态")
+        status_layout = QVBoxLayout()
+
+        self.server_status_label = QLabel("正在检查服务器状态...")
+        self.online_count_label = QLabel("在线人数: 0")
+        self.game_online_count_label = QLabel("游戏内在线: 0")
+
+        status_layout.addWidget(self.server_status_label)
+        status_layout.addWidget(self.online_count_label)
+        status_layout.addWidget(self.game_online_count_label)
+        status_group.setLayout(status_layout)
+
+        # 命令执行区域
+        command_group = QGroupBox("命令执行")
+        command_layout = QVBoxLayout()
+
+        self.command_input = QLineEdit()
+        self.command_input.setPlaceholderText("输入Minecraft命令...")
+        self.command_input.returnPressed.connect(self.execute_command)
+
+        execute_btn = QPushButton("执行命令")
+        execute_btn.clicked.connect(self.execute_command)
+
+        self.command_output = QTextEdit()
+        self.command_output.setReadOnly(True)
+
+        command_layout.addWidget(QLabel("命令:"))
+        command_layout.addWidget(self.command_input)
+        command_layout.addWidget(execute_btn)
+        command_layout.addWidget(QLabel("输出:"))
+        command_layout.addWidget(self.command_output)
+        command_group.setLayout(command_layout)
+
+        # 在线玩家管理区域
+        players_group = QGroupBox("在线玩家管理")
+        players_layout = QVBoxLayout()
+
+        self.players_table = QTableWidget(0, 4)
+        self.players_table.setHorizontalHeaderLabels(["玩家名", "用户ID", "用户名", "操作"])
+        self.players_table.horizontalHeader().setStretchLastSection(True)
+
+        refresh_btn = QPushButton("刷新在线玩家")
+        refresh_btn.clicked.connect(self.refresh_online_players)
+
+        players_layout.addWidget(self.players_table)
+        players_layout.addWidget(refresh_btn)
+        players_group.setLayout(players_layout)
+
+        # 添加到主布局
+        layout.addWidget(status_group)
+        layout.addWidget(command_group)
+        layout.addWidget(players_group)
+
+        # 定时刷新服务器状态
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.refresh_status)
+        self.refresh_timer.start(30000)  # 每30秒刷新一次
+
+        # 初始刷新
+        self.refresh_status()
+
+    def refresh_status(self):
+        """刷新服务器状态"""
+        if self.main.user:
+            # 获取服务器状态
+            self.main.client.send({
+                "type": "get_server_status"
+            }, lambda resp: self._update_server_status(resp))
+
+            # 获取游戏内在线用户
+            self.main.client.send({
+                "type": "get_game_online_users",
+                "user_id": self.main.user['UserID']
+            }, lambda resp: self._update_game_online_status(resp))
+
+    def _update_server_status(self, resp):
+        """更新服务器状态显示"""
+        if resp.get("success"):
+            mc_online = resp.get("mc_server_online", False)
+            online_count = resp.get("online_count", 0)
+
+            if mc_online:
+                self.server_status_label.setText("✅ Minecraft服务器在线")
+                self.server_status_label.setStyleSheet("color: green; font-weight: bold;")
             else:
-                self.badge.hide()
+                self.server_status_label.setText("❌ Minecraft服务器离线")
+                self.server_status_label.setStyleSheet("color: red; font-weight: bold;")
+
+            self.online_count_label.setText(f"在线人数: {online_count}")
+
+    def _update_game_online_status(self, resp):
+        """更新游戏内在线状态"""
+        if resp.get("success"):
+            game_online_users = resp.get("game_online_users", [])
+            self.game_online_count_label.setText(f"游戏内在线: {len(game_online_users)}")
+
+            # 更新在线玩家表格
+            self.players_table.setRowCount(len(game_online_users))
+            for i, user_info in enumerate(game_online_users):
+                self.players_table.setItem(i, 0, QTableWidgetItem(user_info.get("player_name", "")))
+                self.players_table.setItem(i, 1, QTableWidgetItem(str(user_info.get("user_id", ""))))
+                self.players_table.setItem(i, 2, QTableWidgetItem(user_info.get("username", "")))
+
+                # 添加踢出按钮
+                kick_btn = QPushButton("踢出")
+                kick_btn.clicked.connect(lambda checked, name=user_info.get("player_name", ""): self.kick_player(name))
+                self.players_table.setCellWidget(i, 3, kick_btn)
+
+    def execute_command(self):
+        """执行Minecraft命令"""
+        command = self.command_input.text().strip()
+        if not command or not self.main.user:
+            return
+
+        self.main.client.send({
+            "type": "execute_mc_command",
+            "user_id": self.main.user['UserID'],
+            "command": command
+        }, lambda resp: self._on_command_result(resp))
+
+        self.command_input.clear()
+
+    def _on_command_result(self, resp):
+        """处理命令执行结果"""
+        if resp.get("success"):
+            result = resp.get("result", "命令执行成功")
+            self.command_output.append(f">>> {result}")
+        else:
+            error_msg = resp.get("message", "命令执行失败")
+            self.command_output.append(f"ERROR: {error_msg}")
+
+    def kick_player(self, player_name):
+        """踢出玩家"""
+        if not player_name or not self.main.user:
+            return
+
+        reply = QMessageBox.question(self, "确认踢出", f"确定要踢出玩家 {player_name} 吗？")
+        if reply == QMessageBox.Yes:
+            self.main.client.send({
+                "type": "kick_player",
+                "user_id": self.main.user['UserID'],
+                "player_name": player_name,
+                "reason": "被管理员踢出"
+            }, lambda resp: self._on_kick_result(resp, player_name))
+
+    def _on_kick_result(self, resp, player_name):
+        """处理踢出结果"""
+        if resp.get("success"):
+            QMessageBox.information(self, "成功", f"玩家 {player_name} 已被踢出")
+            self.refresh_online_players()  # 刷新在线玩家列表
+        else:
+            error_msg = resp.get("message", "踢出失败")
+            QMessageBox.warning(self, "失败", error_msg)
+
+    def refresh_online_players(self):
+        """刷新在线玩家"""
+        if self.main.user:
+            self.main.client.send({
+                "type": "refresh_game_online_status",
+                "user_id": self.main.user['UserID']
+            }, lambda resp: self.refresh_status())
 
 
 # ========================= 启动 =========================
